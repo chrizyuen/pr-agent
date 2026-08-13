@@ -1,5 +1,6 @@
 """
 Describe all completed PRs for an Azure DevOps repository using PR-Agent.
+Saves descriptions as local markdown files instead of updating PRs remotely.
 
 Prerequisites:
   1. AWS SSO login:  aws sso login --profile ssop-all-all-allx-accadm-001-029099142207
@@ -10,12 +11,17 @@ Prerequisites:
 
 Usage:
   python describe_all_prs.py
+
+Output:
+  Markdown files saved to ./pr_descriptions/<pr_id>.md
 """
 
 import asyncio
 import base64
 import os
+import re
 import sys
+from pathlib import Path
 from urllib.parse import quote
 
 # Ensure AWS Bedrock credentials are picked up via SSO profile
@@ -30,7 +36,7 @@ import requests
 # Azure DevOps configuration
 ADO_ORG = "https://dev.azure.com/jblprd"
 ADO_PROJECT = "JGP Common Data Platform"
-ADO_REPO = "GenAI-AI-Factory"
+ADO_REPO = "GenAI-PL-Invoice"
 
 # PR-Agent needs PYTHONPATH=. to resolve imports
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -187,6 +193,23 @@ async def main():
     get_settings().set("config.model", "bedrock/us.anthropic.claude-sonnet-4-20250514-v1:0")
     get_settings().set("config.fallback_models", ["bedrock/us.anthropic.claude-sonnet-4-20250514-v1:0"])
 
+    # Disable publishing to Azure DevOps — save locally instead
+    get_settings().set("config.publish_output", False)
+
+    # Output directory: pr_descriptions/<repo_name>/
+    output_dir = Path("pr_descriptions") / ADO_REPO
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Migrate any existing .md files from the old flat pr_descriptions/ into the repo subfolder
+    base_dir = Path("pr_descriptions")
+    for old_file in base_dir.glob("*.md"):
+        dest = output_dir / old_file.name
+        if not dest.exists():
+            old_file.rename(dest)
+            print(f"  Migrated: {old_file.name} -> {ADO_REPO}/")
+        else:
+            print(f"  Skipped (already exists): {old_file.name}")
+
     print("Reading ADO_PAT from environment...")
     access_token = get_ado_pat()
     print("  ✓ PAT loaded.\n")
@@ -212,21 +235,51 @@ async def main():
         title = pr.get("title", "(no title)")
         pr_url = build_pr_url(pr_id)
 
+        # Skip if a markdown file for this PR already exists
+        existing = list(output_dir.glob(f"{pr_id}_*.md"))
+        if existing:
+            print(f"[{i}/{len(pull_requests)}] Skipping PR #{pr_id} (already exists: {existing[0].name})")
+            continue
+
         print(f"[{i}/{len(pull_requests)}] Describing PR #{pr_id}: {title}")
         print(f"  URL: {pr_url}")
 
         try:
             result = await describe_pr(pr_url)
-            if result:
-                print(f"  ✓ Done")
+            # When publish_output=False, PR-Agent stores the body in get_settings().data
+            artifact = getattr(get_settings(), "data", None)
+            if artifact and isinstance(artifact, dict):
+                body = artifact.get("artifact", "")
+            elif artifact:
+                body = str(artifact)
             else:
-                print(f"  ✗ Failed (no result)")
+                body = ""
+
+            if body:
+                # Sanitize title for use in filename
+                safe_title = re.sub(r'[<>:"/\\|?*]', '_', title)[:80]
+                filename = f"{pr_id}_{safe_title}.md"
+                filepath = output_dir / filename
+
+                # Write markdown with PR metadata header
+                md_content = f"# PR #{pr_id}: {title}\n\n"
+                md_content += f"**URL:** {pr_url}\n\n"
+                md_content += f"**Author:** {pr.get('createdBy', {}).get('displayName', 'Unknown')}\n\n"
+                md_content += f"**Created:** {pr.get('creationDate', 'Unknown')}\n\n"
+                md_content += f"**Closed:** {pr.get('closedDate', 'Unknown')}\n\n"
+                md_content += "---\n\n"
+                md_content += body
+
+                filepath.write_text(md_content, encoding="utf-8")
+                print(f"  ✓ Saved to {filepath}")
+            else:
+                print(f"  ✗ No description generated")
         except Exception as e:
             print(f"  ✗ Error: {e}")
 
         print()
 
-    print("All PRs processed.")
+    print(f"All PRs processed. Descriptions saved to: {output_dir.resolve()}")
 
 
 if __name__ == "__main__":
