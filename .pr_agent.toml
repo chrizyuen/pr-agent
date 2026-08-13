@@ -3,6 +3,10 @@
 # service. It is NOT read by the open-source pr-agent in this repository; some keys
 # below (e.g. the [review_agent] section) only exist in that hosted agent.
 
+[config]
+model = "bedrock/anthropic.claude-sonnet-4-20250514-v1:0"
+fallback_models = ["bedrock/anthropic.claude-sonnet-4-20250514-v1:0"]
+
 [pr_reviewer]
 enable_review_labels_effort = true
 enable_auto_approval = true
