@@ -13,8 +13,8 @@ Prerequisites:
   3. The LLM calls go through AWS Bedrock (Claude). Make sure your SSO session is active.
 
 Usage:
-  python describe_ado.py prs
-  python describe_ado.py commits <base_commit> <target_commit>
+  python scripts/describe_ado.py prs
+  python scripts/describe_ado.py commits <base_commit> <target_commit>
 
 Output:
   prs     -> ./pr_descriptions/<repo_name>/<pr_id>_<title>.md
@@ -44,12 +44,14 @@ import requests
 # ---------------------------------------------------------------------------
 ADO_ORG = "https://dev.azure.com/jblprd"
 ADO_PROJECT = "JGP Common Data Platform"
-ADO_REPO = "GenAI-PL-Invoice"
+REPOS = ["GenAI-Quoting-and-Scheduling","GenAI-Engineering-Verification-Test-Planning","GenAI-Intelligence-GenRFQ"]
+ADO_REPO = REPOS[1]
 
 MODEL = "bedrock/us.anthropic.claude-sonnet-4-20250514-v1:0"
 
-# PR-Agent needs PYTHONPATH=. to resolve imports
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# Resolve project root (parent of scripts/) so output paths and imports work correctly
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
 
 from pr_agent.agent.pr_agent import PRAgent
 from pr_agent.algo.ai_handlers.litellm_ai_handler import LiteLLMAIHandler
@@ -239,11 +241,11 @@ async def cmd_prs():
     get_settings().set("config.publish_output", False)
 
     # Output directory
-    output_dir = Path("pr_descriptions") / ADO_REPO
+    output_dir = PROJECT_ROOT / "pr_descriptions" / ADO_REPO
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Migrate any old flat files into the repo subfolder
-    base_dir = Path("pr_descriptions")
+    base_dir = PROJECT_ROOT / "pr_descriptions"
     for old_file in base_dir.glob("*.md"):
         dest = output_dir / old_file.name
         if not dest.exists():
@@ -479,17 +481,10 @@ async def describe_diff_with_llm(diff_content: str, base_commit: str, target_com
     return response
 
 
-async def cmd_commits(base_commit: str, target_commit: str):
-    """Compare two commits and save description to local markdown."""
-    output_dir = Path("commit_descriptions") / ADO_REPO
+async def cmd_commits(base_commit: str = None, target_commit: str = None):
+    """Compare two commits, or describe all commits (each vs parent) if none specified."""
+    output_dir = PROJECT_ROOT / "commit_descriptions" / ADO_REPO
     output_dir.mkdir(parents=True, exist_ok=True)
-
-    # Skip if already described
-    output_file = output_dir / f"{base_commit[:8]}..{target_commit[:8]}.md"
-    if output_file.exists():
-        print(f"Already described: {output_file}")
-        print("Delete the file to regenerate.")
-        return
 
     print("Reading ADO_PAT from environment...")
     access_token = get_ado_pat()
@@ -498,22 +493,113 @@ async def cmd_commits(base_commit: str, target_commit: str):
     check_ado_connection(access_token)
     check_aws_bedrock_connection()
 
-    print(f"Fetching diff between {base_commit[:8]} and {target_commit[:8]}...")
+    if base_commit and target_commit:
+        # Describe a specific pair
+        await _describe_commit_pair(access_token, base_commit, target_commit, output_dir)
+    else:
+        # Describe all commits (each commit vs its parent)
+        await _describe_all_commits(access_token, output_dir)
+
+
+def get_all_commits(access_token: str):
+    """Fetch all commits from Azure DevOps REST API, with pagination."""
+    project_encoded = quote(ADO_PROJECT)
+    repo_encoded = quote(ADO_REPO)
+    url = f"{ADO_ORG}/{project_encoded}/_apis/git/repositories/{repo_encoded}/commits"
+    headers = get_ado_headers(access_token)
+
+    all_commits = []
+    skip = 0
+    top = 1000
+
+    while True:
+        params = {
+            "api-version": "7.1",
+            "$top": top,
+            "$skip": skip,
+        }
+        response = requests.get(url, params=params, headers=headers)
+        if response.status_code != 200:
+            print(f"ERROR: Failed to list commits. Status: {response.status_code}")
+            print(response.text)
+            sys.exit(1)
+
+        data = response.json()
+        batch = data.get("value", [])
+        if not batch:
+            break
+
+        all_commits.extend(batch)
+        print(f"  Fetched {len(all_commits)} commits so far...")
+
+        if len(batch) < top:
+            break
+        skip += top
+
+    return all_commits
+
+
+async def _describe_all_commits(access_token: str, output_dir: Path):
+    """Describe each commit by comparing it to its parent."""
+    print(f"Fetching all commits from {ADO_ORG}/{ADO_PROJECT}/_git/{ADO_REPO} ...")
+    commits = get_all_commits(access_token)
+
+    if not commits:
+        print("No commits found.")
+        return
+
+    print(f"\nFound {len(commits)} commit(s). Starting describe...\n")
+
+    for i, commit in enumerate(commits, 1):
+        commit_id = commit["commitId"]
+        comment = commit.get("comment", "(no message)")
+        parents = commit.get("parents", [])
+
+        if not parents:
+            print(f"[{i}/{len(commits)}] Skipping {commit_id[:8]} (no parent — initial commit)")
+            continue
+
+        parent_id = parents[0]
+
+        # Skip if already described
+        output_file = output_dir / f"{parent_id[:8]}..{commit_id[:8]}.md"
+        if output_file.exists():
+            print(f"[{i}/{len(commits)}] Skipping {commit_id[:8]} (already exists)")
+            continue
+
+        print(f"[{i}/{len(commits)}] Describing {commit_id[:8]}: {comment[:60]}")
+
+        try:
+            await _describe_commit_pair(access_token, parent_id, commit_id, output_dir)
+        except Exception as e:
+            print(f"  ✗ Error: {e}")
+
+        print()
+
+    print(f"All commits processed. Descriptions saved to: {output_dir.resolve()}")
+
+
+async def _describe_commit_pair(access_token: str, base_commit: str, target_commit: str, output_dir: Path):
+    """Describe a single commit pair and save to markdown."""
+    # Skip if already described
+    output_file = output_dir / f"{base_commit[:8]}..{target_commit[:8]}.md"
+    if output_file.exists():
+        print(f"  Already described: {output_file.name}")
+        return
+
     diff_content = get_commit_diff(access_token, base_commit, target_commit)
 
     if not diff_content.strip():
-        print("No meaningful diff found between the commits.")
+        print(f"  ✗ No diff found between {base_commit[:8]} and {target_commit[:8]}")
         return
 
-    print(f"  ✓ Diff fetched ({len(diff_content)} chars)\n")
+    print(f"  Diff fetched ({len(diff_content)} chars), generating description...")
 
     # Get commit metadata
     base_info = get_commit_info(access_token, base_commit)
     target_info = get_commit_info(access_token, target_commit)
 
-    print("Generating AI description...")
     description = await describe_diff_with_llm(diff_content, base_commit, target_commit)
-    print("  ✓ Description generated\n")
 
     # Build markdown output
     md_content = f"# Commit Comparison: `{base_commit[:8]}` → `{target_commit[:8]}`\n\n"
@@ -537,7 +623,7 @@ async def cmd_commits(base_commit: str, target_commit: str):
     md_content += description
 
     output_file.write_text(md_content, encoding="utf-8")
-    print(f"  ✓ Saved to {output_file}")
+    print(f"  ✓ Saved to {output_file.name}")
 
 
 # ===========================================================================
@@ -546,36 +632,50 @@ async def cmd_commits(base_commit: str, target_commit: str):
 
 def print_usage():
     print("Usage:")
-    print("  python describe_ado.py prs")
-    print("  python describe_ado.py commits <base_commit> <target_commit>")
+    print("  python scripts/describe_ado.py              (run both prs and commits)")
+    print("  python scripts/describe_ado.py prs")
+    print("  python scripts/describe_ado.py commits")
+    print("  python scripts/describe_ado.py commits <base_commit> <target_commit>")
     print("")
     print("Subcommands:")
+    print("  (none)   Run both prs and commits in sequence")
     print("  prs      Describe all completed PRs and save to ./pr_descriptions/<repo>/")
-    print("  commits  Compare two commits and save to ./commit_descriptions/<repo>/")
+    print("  commits  Describe all commits (each vs parent) or two specific commits")
     print("")
     print("Examples:")
-    print("  python describe_ado.py prs")
-    print("  python describe_ado.py commits abc1234 def5678")
+    print("  python scripts/describe_ado.py")
+    print("  python scripts/describe_ado.py prs")
+    print("  python scripts/describe_ado.py commits")
+    print("  python scripts/describe_ado.py commits abc1234 def5678")
 
 
 async def main():
     if len(sys.argv) < 2:
-        print_usage()
-        sys.exit(1)
+        # No subcommand — run both prs and commits
+        print("=" * 60)
+        print("  Running: describe PRs")
+        print("=" * 60)
+        await cmd_prs()
+        print("\n")
+        print("=" * 60)
+        print("  Running: describe commits")
+        print("=" * 60)
+        await cmd_commits()
+        return
 
     command = sys.argv[1].lower()
 
     if command == "prs":
         await cmd_prs()
     elif command == "commits":
-        if len(sys.argv) < 4:
-            print("ERROR: commits subcommand requires <base_commit> and <target_commit>")
-            print("")
-            print("Usage: python describe_ado.py commits <base_commit> <target_commit>")
-            sys.exit(1)
-        base_commit = sys.argv[2]
-        target_commit = sys.argv[3]
-        await cmd_commits(base_commit, target_commit)
+        if len(sys.argv) >= 4:
+            base_commit = sys.argv[2]
+            target_commit = sys.argv[3]
+            await cmd_commits(base_commit, target_commit)
+        else:
+            await cmd_commits()
+    elif command in ("--help", "-h", "help"):
+        print_usage()
     else:
         print(f"Unknown command: {command}")
         print("")
